@@ -11,8 +11,7 @@ from dicompylercore import dicomparser,dvh
 from dicompylercore.config import skimage_available
 if skimage_available:
     from skimage.transform import rescale
-from dvha.tools.roi_geometry import overlap_volume
-from dvha.tools.roi_formatter import dicompyler_roi_coord_to_db_string, get_planes_from_string, points_to_shapely_polygon
+from dvha.tools.roi_formatter import dicompyler_roi_coord_to_db_string, get_planes_from_string
 import numpy as np
 import copy
 import numpy.ma as ma
@@ -30,6 +29,109 @@ from six import iteritems
 import logging
 logger = logging.getLogger('dicompylercore.dvhcalc')
 
+
+def IsodosePoints(rtss,rtdose,isodoselevelGy):
+    """
+    We don't strictly speaking need the rtss, however this rtss gives us
+    information about which z planes we evaluate the rtdose at'
+
+    Parameters
+    ----------
+    rtss : dicomparser.DicomParser
+        The parsed dicom struct file (not filename).
+    rtdose : dicomparser.DicomParser
+        Parsed RT dose (not filename).
+    isodoselevelGy : Float
+        Threshold level (in Gy) of desired isodose.
+
+    Returns
+    -------
+    isodosepoints : Array of float64
+        Isodose points as a numpy array.
+
+    """
+    
+    #Extract z coordinates of all planes by using body plane
+    body_roi=get_structure_id(rtss.GetStructures(), 'BODY') #find the roi number of the structure called 'BODY'
+    body_coords=rtss.GetStructureCoordinates(body_roi)
+    plane_Zs=np.array(list(body_coords.keys()),dtype=np.float32) #extract and cast to a numpy array
+
+
+    threshold=round(isodoselevelGy/float(rtdose.ds.DoseGridScaling)) #scale threshold to be in the dicom file's desired units. 
+
+    isodosepoints=[None]*1000000 #allocate length of 1M to begin for the isodoses
+    i=0 #initialize i
+    
+    for z in plane_Zs: #loop over all planes #z in dicompylercore actuall seems to correspond to y in eclipse. which is not ideal.
+            isodoseZ=rtdose.GetIsodosePoints(z,threshold,0.1) # this will give list of (x,y) points
+            isodoseZ=[point+(z,) for point in isodoseZ] # this adds z values to the (x,y) tuples
+            
+            if i+1+len(isodoseZ)>len(isodosepoints): #if the isodosepoints collection has run out of room, add more room.
+                isodosepoints.append([None]*1000000)
+            
+            #if isodoseZ is not empty
+            if isodoseZ:
+                isodosepoints[i:i+len(isodoseZ)]=isodoseZ
+                i=i+len(isodoseZ)
+
+    isodosepoints=[point for point in isodosepoints if point !=None] #remove all points with none
+    isodosepoints=np.array(isodosepoints)
+    
+    return isodosepoints
+
+def IsodoseCentroid(rtss,rtdose,isodoselevelGy):
+    """
+    
+
+    Parameters
+    ----------
+    rtss : dicomparser.DicomParser
+        The parsed dicom struct file (not filename).
+    rtdose : dicomparser.DicomParser
+        Parsed RT dose (not filename).
+    isodoselevelGy : Float
+        Threshold level (in Gy) of desired isodose.
+    Returns
+    -------
+    centroid : Array of float64
+        Centroid of isodose.
+
+    """
+    isodosepoints=IsodosePoints(rtss,rtdose,isodoselevelGy)
+    
+    centroid=np.around([np.mean(isodosepoints[:,0]),
+                        np.mean(isodosepoints[:,1]),
+                        np.mean(isodosepoints[:,2])
+                        ],2
+                       )
+    return centroid
+
+
+
+def Centroid(rtss,contour):
+    """
+    Returns centroid of a contour
+
+    Parameters
+    ----------
+    rtss : dicomparser.DicomParser
+        parsed RTSS.
+    contour : String
+        contour name.
+
+    Returns
+    -------
+    centroid : numpy array
+        centroid of contour.
+
+    """
+    vertices=Get_Vertices(rtss, oar=contour)
+    centroid=np.around([np.mean(vertices[:,0]),
+                        np.mean(vertices[:,1]),
+                        np.mean(vertices[:,2])
+                        ],2
+                       )
+    return centroid
 
 
 def RT_FeatureExtract(rtss_path,
@@ -57,7 +159,7 @@ def RT_FeatureExtract(rtss_path,
    and nonadaptive rt-dose and rt-struct files. In this case, shift vector of 
    translation such that applying this translation to the adaptive structure
    set will maximize GTV overlap with the base structure set. Such a shift
-   vector can be found using the find_GTV_overlap_vector function in this
+   vector can be found using the find_GTV_overlap_vector function later in this
    toolbox.
 
     Parameters
@@ -242,13 +344,13 @@ def GetPlane(parsed_rt_struct,structure_name):
     return structure_plane
         
 
-def find_GTV_overlap_vector(initial_guess,base_rtss_path,ada_rtss_path,oarbase='GTV',oarada='GTV'):
+def find_GTV_overlap_vector(initial_guess,base_rtss_path,frac_rtss_path,oarbase='GTV',oarada='GTV'):
     """
-    This script takes a base and fraction rt-struct (as filepaths) and computes the translation vector
+    This script takes a base and fraction rt-struct and computes the translation vector
     that, when applied to the fraction, will maximize GTV overlap with the base. The negative
     of this vector can be added to the base RT-dose to create a plan for the fraction. Alternately,
     The vector itself can be added to the fraction verts to overlap with the base dose cube. The latter
-    approach is what we usually take. If overlap vector is desired for a different contour, change the oarbase and oarada strings accordingly.
+    approach is what we usually take.
 
     Parameters
     ----------
@@ -256,13 +358,12 @@ def find_GTV_overlap_vector(initial_guess,base_rtss_path,ada_rtss_path,oarbase='
         Intial guess for vector of translation, which will be applied to the ada_gtv_vertices.
     base_rtss_path : str
         Path of base rtstruct file
-    ada_rtss_path : str
+    frac_rtss_path : str
         path of fraction rtstruct file.
     oarbase : str
         name of structure in base rtss, default is 'GTV'
     oarfrac : str
         name of structure in frac rtss, default is 'GTV'        
-
 
 
     Returns
@@ -274,10 +375,35 @@ def find_GTV_overlap_vector(initial_guess,base_rtss_path,ada_rtss_path,oarbase='
 
     #load vertices of base and adaptive fraction gtv
     base_vertices=Get_Vertices(dicomparser.DicomParser(base_rtss_path),oar=oarbase)
-    ada_vertices=Get_Vertices(dicomparser.DicomParser(ada_rtss_path),oar=oarada)
+    ada_vertices=Get_Vertices(dicomparser.DicomParser(frac_rtss_path),oar=oarada)
     
     Min_Obj=minimize(hull_volume_translate,initial_guess,args=(base_vertices,
                                                                ada_vertices))
+    return Min_Obj.x
+
+def find_overlap_vector(initial_guess,base_vertices, frac_vertices):
+    """
+    This script takes a pair of vertex sets, and then finds a shift vector
+    that when applied to frac_vertices, maximizes overlap with base_vertices.
+    Parameters
+    ----------
+    initial_guess : numpy ndarray of size 3
+        Intial guess for vector of translation, which will be applied to the ada_gtv_vertices.
+    base_vertices : np.array
+        array of coordinate triplets containing base contour vertices.
+    frac_vertices : np.array
+        array of coordinate triplets containing frac contour vertices. 
+
+
+    Returns
+    -------
+    Array of float64
+         An array of size 3 specifying the vector that maximized gtv overlap.
+
+    """
+
+    Min_Obj=minimize(hull_volume_translate,initial_guess,args=(base_vertices,
+                                                               frac_vertices))
     return Min_Obj.x
 
 
@@ -298,7 +424,7 @@ def Get_Vertices(rtss,oar='GTV'):
         array of coordinate triplets containing contour vertices.
 
     """
-    planes=gtvplanes=GetPlane(rtss, oar)
+    planes=GetPlane(rtss, oar)
     
     verts3d=[]
     for plane_key in planes:
@@ -306,8 +432,6 @@ def Get_Vertices(rtss,oar='GTV'):
         for entry in plane_values: 
             verts3d.append(entry)    
     return np.array(verts3d)
-
-
 
 def hull_volume_translate(shift_vector,base_verts,ada_verts):
     """
@@ -334,19 +458,48 @@ def hull_volume_translate(shift_vector,base_verts,ada_verts):
     ada_verts_translated=ada_verts+shift_vector
     allpoints=np.concatenate((base_verts,ada_verts_translated))
     #compute volume and return
+    cv=ConvexHull(allpoints)
+    volume=cv.volume
+    return volume
+
+def hull_volume_translate_verts(base_verts,ada_verts,shift_vector=[0,0,0]):
+    """
+    Applies a translation vector to contour, then computes convex hull of that contour;s
+    points with the base contour (TP0 GTV)'s points. Can be used with an optimizer to find
+    shift vector that minimizes convex hull volume (this is the same as maximizing overlap).
+    Can be used to compute volume of CV if the shift_vector is set to [0,0,0]
+
+    Parameters
+    ----------
+    base_gtv_vertices : numpy ndarray
+        List of coordinate triplets containing contour vertices (TP0).
+    secondOrganVerts : numpy ndarray
+         List of coordinate triplets containing contour vertices (fraction).
+    shift_vector : numpy ndarray
+        Vector of translation, which will be applied to the ada_gtv_vertices.
+    Returns
+    -------
+    volume : float
+        Volume of convex hull after translation vector is applied to adaptive vertices.
+
+    """
+    #translate the adaptive fraction vertices and concatenate with base vertices
+    ada_verts_translated=ada_verts+shift_vector
+    allpoints=np.concatenate((base_verts,ada_verts_translated))
+    #compute volume and return
     volume=ConvexHull(allpoints).volume
     return volume
 
 
-def hull_volume_compute(base_gtv_verts,ada_gtv_verts):
+def hull_volume_compute(firstOrganVerts,secondOrganVerts):
     """
     Computes the volume of the convex hull of two sets of vertices
 
     Parameters
     ----------
-    base_gtv_vertis : numpy ndarray
+    firstOrganVerts : numpy ndarray
         List of coordinate triplets containing contour vertices (TP0).
-    ada_gtv_verts : numpy ndarray
+    secondOrganVerts : numpy ndarray
          List of coordinate triplets containing contour vertices (fraction).
 
     Returns
@@ -356,7 +509,7 @@ def hull_volume_compute(base_gtv_verts,ada_gtv_verts):
 
     """
     #translate the adaptive fraction vertices and concatenate with base vertices
-    allpoints=np.concatenate((base_gtv_verts,ada_gtv_verts))
+    allpoints=np.concatenate((firstOrganVerts,secondOrganVerts))
     #compute volume and return
     volume=ConvexHull(allpoints).volume
     return volume
